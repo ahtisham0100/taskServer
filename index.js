@@ -2,16 +2,15 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import fs from 'fs';
-import path from 'path';
 import { fileURLToPath } from 'url';
 import extract from 'pdf-text-extract';
 import PDFParser from 'pdf2json';
-const __filename = fileURLToPath(import.meta.url);
 import { API_KEY } from "./config.js"; // Importing api key
 const MONDAY_API_URL = "https://api.monday.com/v2";
 
-console.log("Monday API Key:", API_KEY); // Test if it loads correctly
+console.log("Monday API Key:", API_KEY); // for Test if it loads correctly
 
+const BOARD_ID = "1979257003"; //  board ID
 const port = 3000;
 const app = express();
 const parser = new PDFParser();
@@ -22,68 +21,107 @@ app.use(express.json());
 const upload = multer({ dest: 'uploads/' });
 
 // PDF Processing Route
-app.post('/upload', upload.single('pdf'), async (req, res) => { 
+app.post('/upload', upload.fields([{ name: 'pdf' }, { name: 'email' }]), async (req, res) => {  
     try {
-        if (!req.file) {
-            return res.status(400).json({ error: 'No file uploaded' });
+        const projectName = req.body.projectname;
+        const mailFile = req.files['email'] ? req.files['email'][0] : null;
+        const pdfFile = req.files['pdf'] ? req.files['pdf'][0] : null;
+
+        if (!projectName || !mailFile || !pdfFile) {
+            return res.status(400).json({ error: 'Missing required fields' });
         }
 
-        console.log("File uploaded:", req.file.filename);
+        console.log("Files uploaded:", mailFile.filename, pdfFile.filename);
 
-        // Extract text from the uploaded PDF
-        extract(req.file.path, { splitPages: false }, (err, text) => {
-            if (err) {
-                console.error('Error extracting text:', err);
-                return res.status(500).json({ error: 'Failed to extract text from PDF' });
-            }
-            var pdfdata = Array.isArray(text) ? text.join(' ') : text; 
-            pdfdata = pdfdata.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank">$1</a>');
-            console.log(pdfdata);
-            
-            // console.log('Extracted text:', text);
-            res.json({ text }); // Send extracted text as JSON
-
-            // Delete the file after processing
-            fs.unlink(req.file.path, (unlinkErr) => {
-                if (unlinkErr) console.error('Error deleting file:', unlinkErr);
+        // function to  Extract text from both PDFs
+        const extractText = (filePath) =>
+            new Promise((resolve, reject) => {
+                extract(filePath, { splitPages: false }, (err, text) => {
+                    if (err) return reject(err);
+                    resolve(Array.isArray(text) ? text.join(' ') : text);
+                });
             });
-        });
+ 
+
+            //extracting data from the pdf;
+        const emailContent = await extractText(mailFile.path);
+        const workOrderContent = await extractText(pdfFile.path);
+
+        // Upload data to Monday.com
+        const response = await addTaskToMonday(projectName, emailContent, workOrderContent);
+        console.log('Monday.com Response:', response);
+
+        // Clean up uploaded files
+        fs.unlink(mailFile.path, (err) => err && console.error('Error deleting email file:', err));
+        fs.unlink(pdfFile.path, (err) => err && console.error('Error deleting work order file:', err));
+
+        res.json({ message: 'Data uploaded successfully to Monday.com', response });
 
     } catch (error) {
         console.error('Unexpected error:', error);
         res.status(500).json({ error: 'Something went wrong' });
     }
 });
- 
- 
-// uploading the content of the pdf file to the monday.com board 
 
-app.get("/postToModay", async (req, res) => {
+// Function to send data to Monday.com board
+async function addTaskToMonday(projectName, workOrderData, emailContent) {
     try {
-        const monday = require("monday-sdk-js");
+        const columnValues = {
+            text_mknm5hg3: workOrderData, // WorkOrder column
+            text_mknmejk1: emailContent // EmailContent column
+        };
 
-        fetch ("https://api.monday.com/v2", {
+        const query = {
+            query: `mutation {
+                create_item (
+                    board_id: ${BOARD_ID}, 
+                    item_name: "${projectName}", 
+                    column_values: ${JSON.stringify(JSON.stringify(columnValues))}
+                ) {
+                    id
+                }
+            }`
+        };
+
+        const response = await fetch(MONDAY_API_URL, {
             method: 'POST',
             headers: {
-              'Content-Type': 'application/json',
-              'Authorization' : 'YOUR_API_KEY_HERE'
-             },
-             body: JSON.stringify({
-               query : query
-             })
-            })
-             .then(res => res.json())
-             .then(res => console.log(JSON.stringify(res, null, 2)));
+                'Content-Type': 'application/json',
+                'Authorization': API_KEY
+            },
+            body: JSON.stringify(query)
+        });
 
-
+        const data = await response.json();
+        console.log("Monday.com Update Response:", data);
+        return data;
     } catch (error) {
-        console.error('Unexpected error:', error);
-        res.status(500).json({ error: 'Something went wrong' });
+        console.error("Error updating Monday.com board:", error);
     }
-
-res.send("Hello World");
 }
-)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 app.get('/', (req, res) => {
     res.send('Hello World');
@@ -93,34 +131,39 @@ app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
  
-
-
-
+ 
 
  
 
 
 
-async function getBoardId() {
-    const query = JSON.stringify({ query: `{ boards { id name } }` });
 
-    try {
-        const response = await fetch(MONDAY_API_URL, {
-            method: "POST", // Must be POST for GraphQL queries
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": API_KEY
-            },
-            body: query, // Send query in the request body
-        });
+// columns ids 
 
-        const data = await response.json(); // Convert response to JSON
+async function getBoardColumns() {
+    const query = {
+        query: `{
+            boards (ids: ${BOARD_ID}) {
+                columns {
+                    id
+                    title
+                    type
+                }
+            }
+        }`
+    };
 
-        console.log("📌 Available Boards:", data.data.boards);
-    } catch (error) {
-        console.error("❌ Error Fetching Board ID:", error.message);
-    }
+    const response = await fetch('https://api.monday.com/v2', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': API_KEY
+        },
+        body: JSON.stringify(query)
+    });
+
+    const data = await response.json();
+    console.log(JSON.stringify(data, null, 2)); // Pretty print the response
 }
 
-// Run function
-getBoardId();
+getBoardColumns();
